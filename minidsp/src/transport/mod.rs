@@ -143,11 +143,11 @@ pub async fn open_url(url: &Url2) -> Result<Transport, MiniDSPError> {
     match url.scheme() {
         #[cfg(feature = "hid")]
         "usb" => {
-            let api = hid::initialize_api()?;
-            let api = api.lock().unwrap();
-            Ok(hid::HidTransport::with_url(&api, url)
-                .map_err(MiniDSPError::HIDError)?
-                .into_transport())
+            let url = url.clone();
+            let transport = hid::with_api(move |api| hid::HidTransport::with_url(api, &url))
+                .and_then(|transport| transport)
+                .map_err(MiniDSPError::HIDError)?;
+            Ok(transport.into_transport())
         }
         "tcp" => Ok(net::open_url(url).await?.into_transport()),
         "ws" | "wss" => Ok(ws::open_url(url)

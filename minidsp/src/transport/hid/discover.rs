@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use hidapi::{HidApi, HidError};
 
-use super::{initialize_api, HidTransport, OLD_MINIDSP_PID, VID_MINIDSP};
+use super::{with_api, HidTransport, OLD_MINIDSP_PID, VID_MINIDSP};
 use crate::transport::{IntoTransport, MiniDSPError, Openable, Transport};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,18 +65,19 @@ impl fmt::Display for Device {
 #[async_trait]
 impl Openable for Device {
     async fn open(&self) -> Result<Transport, MiniDSPError> {
-        let hid = initialize_api()?;
-        let hid = hid.lock().unwrap();
-
-        if let Some(path) = &self.path {
-            Ok(HidTransport::with_path(&hid, path.to_string())?.into_transport())
-        } else if let Some((vid, pid)) = &self.id {
-            Ok(HidTransport::with_product_id(&hid, *vid, *pid)?.into_transport())
-        } else {
-            Err(MiniDSPError::InternalError(anyhow!(
-                "invalid device, no path or id"
-            )))
-        }
+        let (path, id) = (self.path.clone(), self.id);
+        let transport = with_api(move |hid| {
+            if let Some(path) = path {
+                Ok(HidTransport::with_path(hid, path)?)
+            } else if let Some((vid, pid)) = id {
+                Ok(HidTransport::with_product_id(hid, vid, pid)?)
+            } else {
+                Err(MiniDSPError::InternalError(anyhow!(
+                    "invalid device, no path or id"
+                )))
+            }
+        })??;
+        Ok(transport.into_transport())
     }
 
     fn to_url(&self) -> String {

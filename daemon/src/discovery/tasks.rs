@@ -6,22 +6,19 @@ use log::warn;
 use minidsp::transport;
 
 pub async fn hid_discovery_task(register: impl Fn(&str)) -> Result<()> {
-    let api = transport::hid::initialize_api()?;
+    transport::hid::initialize_api()?;
 
     loop {
         log::trace!("discovering");
-        {
-            let mut api = api.lock().unwrap();
-            match transport::hid::discover(&mut api) {
-                Ok(devices) => {
-                    for device in devices {
-                        log::trace!("seen: {:?}", device.to_url());
-                        register(device.to_url().as_str());
-                    }
+        match transport::hid::with_api(transport::hid::discover).and_then(|devices| devices) {
+            Ok(devices) => {
+                for device in devices {
+                    log::trace!("seen: {:?}", device.to_url());
+                    register(device.to_url().as_str());
                 }
-                Err(e) => {
-                    warn!("failed to enumerate hid devices: {e}");
-                }
+            }
+            Err(e) => {
+                warn!("failed to enumerate hid devices: {e}");
             }
         }
 

@@ -111,9 +111,7 @@ impl Builder {
     /// Add all local devices matching known minidsp vendor and product ids
     #[cfg(feature = "hid")]
     pub fn with_default_usb(&mut self) -> Result<&mut Self, hid::HidError> {
-        let api = hid::initialize_api()?;
-        let mut api = api.lock().unwrap();
-        self.extend_hid_device(hid::discover(&mut api)?);
+        self.extend_hid_device(hid::with_api(hid::discover)??);
         Ok(self)
     }
 
@@ -124,12 +122,12 @@ impl Builder {
         vid: u16,
         pid: T,
     ) -> Result<&mut Self, hid::HidError> {
-        let api = hid::initialize_api()?;
-        let mut api = api.lock().unwrap();
         let pid = pid.into();
-        self.extend_hid_device(hid::discover_with(&mut api, |dev| {
-            vid == dev.vendor_id() && (pid.is_none() || pid == Some(dev.product_id()))
-        })?);
+        self.extend_hid_device(hid::with_api(move |api| {
+            hid::discover_with(api, |dev| {
+                vid == dev.vendor_id() && (pid.is_none() || pid == Some(dev.product_id()))
+            })
+        })??);
         Ok(self)
     }
 

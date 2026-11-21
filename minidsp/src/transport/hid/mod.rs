@@ -1,12 +1,13 @@
 //! HID transport for local USB devices
 use std::{
+    cell::Cell,
     collections::HashMap,
-    ops::Deref,
-    sync::{Arc, Mutex},
+    panic::{self, AssertUnwindSafe},
+    sync::{mpsc, Arc, Mutex, OnceLock},
+    thread,
 };
 
 use anyhow::Result;
-use atomic_refcell::AtomicRefCell;
 
 use futures::{SinkExt, TryStreamExt};
 pub use hidapi::HidError;
@@ -24,17 +25,78 @@ use super::IntoTransport;
 pub const VID_MINIDSP: u16 = 0x2752;
 pub const OLD_MINIDSP_PID: (u16, u16) = (0x04d8, 0x003f);
 
-static HIDAPI_INSTANCE: AtomicRefCell<Option<Arc<Mutex<HidApi>>>> = AtomicRefCell::new(None);
+static HIDAPI_INSTANCE: Mutex<Option<Arc<Mutex<HidApi>>>> = Mutex::new(None);
 
-/// Initializes a global instance of HidApi
-pub fn initialize_api() -> HidResult<Arc<Mutex<HidApi>>> {
-    if let Some(x) = HIDAPI_INSTANCE.borrow().deref() {
-        return Ok(x.clone());
+type HidJob = Box<dyn FnOnce() + Send>;
+
+thread_local! {
+    static ON_HID_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` on the dedicated, long-lived hidapi thread and waits for its result.
+///
+/// hidapi's macOS backend schedules its global `IOHIDManager` on the run loop of whichever thread
+/// first calls `hid_init`, and every later enumeration schedules the matched devices on that same
+/// run loop. If that thread exits, its run loop is freed and the next enumeration crashes in
+/// `CFRunLoopAddSource` (EXC_BREAKPOINT in `__CFCheckCFInfoPACSignature`). Under tokio this happens
+/// whenever the initializing worker goes through `block_in_place` (as HID writes do) and is later
+/// retired from the blocking pool. Funnelling every `HidApi` call through one thread that never
+/// exits keeps that run loop alive, and matches hidapi's single-thread expectation on all platforms.
+fn run_on_hid_thread<R, F>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    if ON_HID_THREAD.with(Cell::get) {
+        return f();
     }
 
-    let api = Arc::new(Mutex::new(HidApi::new()?));
-    HIDAPI_INSTANCE.borrow_mut().replace(api.clone());
+    static JOBS: OnceLock<mpsc::Sender<HidJob>> = OnceLock::new();
+    let jobs = JOBS.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<HidJob>();
+        thread::Builder::new()
+            .name("hidapi".into())
+            .spawn(move || {
+                ON_HID_THREAD.with(|flag| flag.set(true));
+                for job in rx {
+                    // A panicking job must not take the thread (and its run loop) down with it.
+                    let _ = panic::catch_unwind(AssertUnwindSafe(job));
+                }
+            })
+            .expect("failed to spawn hidapi thread");
+        tx
+    });
+
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    jobs.send(Box::new(move || {
+        let _ = result_tx.send(f());
+    }))
+    .expect("hidapi thread is gone");
+    result_rx.recv().expect("hidapi call panicked")
+}
+
+/// Initializes a global instance of HidApi, created on the dedicated hidapi thread.
+///
+/// Prefer [`with_api`], which also runs the call itself on that thread.
+pub fn initialize_api() -> HidResult<Arc<Mutex<HidApi>>> {
+    let mut instance = HIDAPI_INSTANCE.lock().unwrap();
+    if let Some(api) = instance.as_ref() {
+        return Ok(api.clone());
+    }
+
+    let api = Arc::new(Mutex::new(run_on_hid_thread(HidApi::new)?));
+    instance.replace(api.clone());
     Ok(api)
+}
+
+/// Runs `f` with the global HidApi on the dedicated hidapi thread (see [`run_on_hid_thread`]).
+pub fn with_api<R, F>(f: F) -> HidResult<R>
+where
+    F: FnOnce(&mut HidApi) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let api = initialize_api()?;
+    Ok(run_on_hid_thread(move || f(&mut api.lock().unwrap())))
 }
 
 pub struct HidTransport {
