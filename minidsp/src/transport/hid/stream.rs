@@ -105,9 +105,13 @@ impl HidStream {
                         tx.unbounded_send(Ok(read_buf.freeze()))?;
                     }
                     Err(e) => {
-                        // device error
+                        // Device error: report it once and stop reading. The multiplexer treats the first
+                        // error as fatal and closes the transport, but the sink half keeps `tx` open, so
+                        // looping here would retry a disconnected device with no wait: every read fails at
+                        // once, and the log line above was written millions of times a second.
                         log::error!("error in hid receive loop: {e:?}");
-                        tx.unbounded_send(Err(e))?;
+                        let _ = tx.unbounded_send(Err(e));
+                        return Ok(());
                     }
                 }
             }
